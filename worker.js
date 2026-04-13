@@ -2,192 +2,333 @@ const upstream = 'www.gimkit.com';
 const upstream_mobile = null;
 const upstream_path = '/';
 const upstream_allow_override = false;
-const upstream_get_parameter = 'CORSflare_upstream';
+const upstream_get_parameter = 'gimods_injector_upstream';
 const blocked_regions = ['CN', 'KP', 'SY', 'PK', 'CU'];
 const blocked_ip_addresses = ['0.0.0.0', '127.0.0.1'];
 const https = true;
 const set_cookie_samesite_none = false;
+
 const http_response_headers_set = {
-    'X-Frame-Options': 'ALLOW FROM https://www.example.com', 
-    'Content-Security-Policy': "frame-ancestors 'self' https://www.example.com;", 
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Credentials': true,
+  'X-Frame-Options': 'ALLOW FROM https://www.example.com',
+  'Content-Security-Policy': "frame-ancestors 'self' https://www.example.com;",
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Credentials': true,
+  'X-Proxy-Injector': 'gimods Injector',
 };
+
 const http_response_headers_delete = [
-    'Content-Security-Policy-Report-Only',
-    'Clear-Site-Data'
+  'Content-Security-Policy-Report-Only',
+  'Clear-Site-Data',
 ];
-const replacement_rules = {
-    'http://{upstream_hostname}/': 'https://{proxy_hostname}/',
-    '{upstream_hostname}': '{proxy_hostname}',
-}
-const replacement_content_types = ['text/html'];
-const replacement_use_regex = true;
-var regexp_upstreamHostname = (replacement_use_regex)
-    ? new RegExp('{upstream_hostname}', 'g')
-    : null;
-var regexp_proxyHostname = (replacement_use_regex)
-    ? new RegExp('{proxy_hostname}', 'g')
-    : null;
+
+const replacement_rules = [
+  { search: 'http://{upstream_hostname}/', replace: 'https://{proxy_hostname}/' },
+  { search: 'https://{upstream_hostname}/', replace: 'https://{proxy_hostname}/' },
+  { search: '//{upstream_hostname}/', replace: '//{proxy_hostname}/' },
+  { search: 'http:\\/\\/{upstream_hostname}', replace: 'https:\\/\\/{proxy_hostname}' },
+  { search: 'https:\\/\\/{upstream_hostname}', replace: 'https:\\/\\/{proxy_hostname}' },
+  { search: '{upstream_hostname}', replace: '{proxy_hostname}' },
+];
+
+const replacement_content_types = [
+  'text/html',
+  'text/css',
+  'application/javascript',
+  'text/javascript',
+  'application/x-javascript',
+  'application/json',
+];
+const default_mirrored_hostnames = ['gimkit.com', 'www.gimkit.com'];
+
 addEventListener('fetch', event => {
-    event.respondWith(fetchAndApply(event.request));
-})
+  event.respondWith(fetchAndApply(event.request));
+});
+
 async function fetchAndApply(request) {
-    var r = request.headers.get('cf-ipcountry');
-    const region = (r) ? r.toUpperCase() : null;
-    const ip_address = request.headers.get('cf-connecting-ip');
-    const user_agent = request.headers.get('user-agent');
-    let response = null;
-    let url = new URL(request.url);
-    let url_hostname = url.hostname;
-    let upstream_GET = (upstream_allow_override) ? url.searchParams.get(upstream_get_parameter) : null;
-    if (https == true) {
-        url.protocol = 'https:';
-    } else {
-        url.protocol = 'http:';
+  const regionHeader = request.headers.get('cf-ipcountry');
+  const region = regionHeader ? regionHeader.toUpperCase() : null;
+  const ipAddress = request.headers.get('cf-connecting-ip');
+  const userAgent = request.headers.get('user-agent') || '';
+
+  if (blocked_regions.includes(region) || blocked_ip_addresses.includes(ipAddress)) {
+    return new Response('Access denied', { status: 403 });
+  }
+
+  const requestUrl = new URL(request.url);
+  const proxyHost = requestUrl.host;
+  const proxyOrigin = requestUrl.origin;
+
+  const upstreamGET = upstream_allow_override ? requestUrl.searchParams.get(upstream_get_parameter) : null;
+  let upstreamDomain;
+  if (upstreamGET) {
+    upstreamDomain = upstreamGET;
+  } else if (upstream_mobile && is_mobile_user_agent(userAgent)) {
+    upstreamDomain = upstream_mobile;
+  } else {
+    upstreamDomain = upstream;
+  }
+
+  const upstreamUrl = new URL(requestUrl.href);
+  upstreamUrl.protocol = https ? 'https:' : 'http:';
+  upstreamUrl.host = upstreamDomain;
+  upstreamUrl.pathname = requestUrl.pathname === '/' ? upstream_path : `${upstream_path}${requestUrl.pathname}`;
+
+  const newRequestHeaders = new Headers(request.headers);
+  newRequestHeaders.set('Host', upstreamDomain);
+  newRequestHeaders.set('Origin', `${upstreamUrl.protocol}//${upstreamDomain}`);
+  newRequestHeaders.set('Referer', `${upstreamUrl.protocol}//${upstreamDomain}/`);
+
+  const requestInit = {
+    method: request.method,
+    headers: newRequestHeaders,
+    redirect: 'manual',
+  };
+
+  if (!['GET', 'HEAD'].includes(request.method.toUpperCase())) {
+    requestInit.body = request.body;
+  }
+
+  const upstreamResponse = await fetch(upstreamUrl.toString(), requestInit);
+
+  const connectionUpgrade = newRequestHeaders.get('Upgrade');
+  if (connectionUpgrade && connectionUpgrade.toLowerCase() === 'websocket') {
+    return upstreamResponse;
+  }
+
+  const responseHeaders = new Headers(upstreamResponse.headers);
+
+  for (const [header, value] of Object.entries(http_response_headers_set)) {
+    responseHeaders.set(header, value);
+  }
+
+  for (const header of http_response_headers_delete) {
+    responseHeaders.delete(header);
+  }
+
+  rewriteHeaderUrl(responseHeaders, 'x-pjax-url', upstreamUrl, upstreamDomain, proxyHost, proxyOrigin);
+  rewriteHeaderUrl(responseHeaders, 'location', upstreamUrl, upstreamDomain, proxyHost, proxyOrigin);
+
+  if (set_cookie_samesite_none && responseHeaders.has('set-cookie')) {
+    const firstCookie = responseHeaders.get('set-cookie').split(',').shift();
+    responseHeaders.set(
+      'set-cookie',
+      firstCookie
+        .split('SameSite=Lax; Secure').join('')
+        .split('SameSite=Lax').join('')
+        .split('SameSite=Strict; Secure').join('')
+        .split('SameSite=Strict').join('')
+        .split('SameSite=None; Secure').join('')
+        .split('SameSite=None').join('')
+        .replace(/^;+$/g, '') + '; SameSite=None; Secure'
+    );
+  }
+
+  const responseContentType = (responseHeaders.get('content-type') || '').toLowerCase();
+  const shouldRewrite = replacement_content_types.some(v => responseContentType.includes(v));
+
+  if (!shouldRewrite) {
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers: responseHeaders,
+    });
+  }
+
+  const originalText = await upstreamResponse.text();
+  const rewrittenText = rewriteBodyText(
+    originalText,
+    upstreamDomain,
+    proxyHost,
+    proxyOrigin,
+    upstreamUrl.toString()
+  );
+
+  return new Response(rewrittenText, {
+    status: upstreamResponse.status,
+    headers: responseHeaders,
+  });
+}
+
+function rewriteHeaderUrl(headers, headerName, upstreamUrl, upstreamDomain, proxyHost, proxyOrigin) {
+  if (!headers.has(headerName)) {
+    return;
+  }
+
+  const headerValue = headers.get(headerName);
+  let rewritten = rewriteAnyUrlString(headerValue, upstreamDomain, proxyHost, proxyOrigin, upstreamUrl.toString());
+
+  if (upstream_allow_override && headerName === 'location') {
+    const parsedRaw = safeParseUrl(headerValue, upstreamUrl.toString());
+    if (parsedRaw && isExactOrSubdomain(parsedRaw.hostname, 'googleusercontent.com')) {
+      rewritten = `${rewritten}&${upstream_get_parameter}=${parsedRaw.hostname}`;
     }
-    var upstream_domain = null;
-    if (upstream_GET) {
-        upstream_domain = upstream_GET;
-    }
-    else if (upstream_mobile && await is_mobile_user_agent(user_agent)) {
-        upstream_domain = upstream_mobile;
-    }
-    else {
-        upstream_domain = upstream;
-    }
-    url.host = upstream_domain;
-    if (url.pathname == '/') {
-        url.pathname = upstream_path;
-    } else {
-        url.pathname = upstream_path + url.pathname;
-    }
-    if (blocked_regions.includes(region) || blocked_ip_addresses.includes(ip_address)) {
-        response = new Response('Access denied', {
-            status: 403
-        });
-    } else {
-        let method = request.method;
-        let request_headers = request.headers;
-        let new_request_headers = new Headers(request_headers);
-        let request_content_type = new_request_headers.get('content-type');
-        new_request_headers.set('Host', upstream_domain);
-        new_request_headers.set('Origin', upstream_domain);
-        new_request_headers.set('Referer', url.protocol + '
-        var params = {
-            method: method,
-            headers: new_request_headers,
-            redirect: 'manual'
-        }
-        if (method.toUpperCase() === "POST" && request_content_type) {
-            let request_content_type_toLower = request_content_type.toLowerCase();
-            if (request_content_type_toLower.includes("application/x-www-form-urlencoded")
-                || request_content_type_toLower.includes("multipart/form-data")
-                || request_content_type_toLower.includes("application/json")
-            ) {
-                let reqText = await request.text(); 
-                if (reqText) {
-                    params.body = reqText;
-                }
-            }
-        }
-        let original_response = await fetch(url.href, params);
-        connection_upgrade = new_request_headers.get("Upgrade");
-        if (connection_upgrade && connection_upgrade.toLowerCase() == "websocket") {
-            return original_response;
-        }
-        let original_response_clone = original_response.clone();
-        let response_headers = original_response_clone.headers;
-        let response_status = original_response_clone.status;
-        let original_text = null;
-        let new_response_headers = new Headers(response_headers);
-        let new_response_status = response_status;
-        if (http_response_headers_set) {
-            for (let k in http_response_headers_set) {
-                var v = http_response_headers_set[k];
-                new_response_headers.set(k, v);
-            }
-        }
-        if (http_response_headers_delete) {
-            for (let k of http_response_headers_delete) {
-                new_response_headers.delete(k);
-            }
-        }
-        if (new_response_headers.get("x-pjax-url")) {
-            new_response_headers.set("x-pjax-url", new_response_headers.get("x-pjax-url")
-                .replace(url.protocol + "
-                .replace(upstream_domain, url_hostname));
-        }
-        if (new_response_headers.get("location")) {
-            var location = new_response_headers.get("location");
-            if (upstream_allow_override && location.includes("googleusercontent.com")) {
-                var new_upstream = location.substring(8, location.indexOf("/", 8));
-                location = location + "&" + upstream_get_parameter + "=" + new_upstream;
-                new_response_headers.set("location", location
-                    .replace(url.protocol + "
-                    .replace(new_upstream, url_hostname));
-            }
-            else {
-                new_response_headers.set("location", location
-                    .replace(url.protocol + "
-                    .replace(upstream_domain, url_hostname));
-            }
-        }
-        if (set_cookie_samesite_none && new_response_headers.has("set-cookie")) {
-            var firstCookie = new_response_headers.get("set-cookie").split(',').shift();
-            new_response_headers.set("set-cookie", firstCookie
-                .split("SameSite=Lax; Secure").join("")
-                .split("SameSite=Lax").join("")
-                .split("SameSite=Strict; Secure").join("")
-                .split("SameSite=Strict").join("")
-                .split("SameSite=None; Secure").join("")
-                .split("SameSite=None").join("")
-                .replace(/^;+$/g, '')
-                + "; SameSite=None; Secure");
-        }
-        let response_content_type = new_response_headers.get('content-type');
-        if (response_content_type
-            && replacement_content_types.some(v => response_content_type.toLowerCase().includes(v))) {
-            original_text = await replace_response_text(original_response_clone, upstream_domain, url_hostname);
-        } else {
-            original_text = original_response_clone.body;
-        }
-        response = new Response(original_text, {
-            status: new_response_status,
-            headers: new_response_headers
+  }
+
+  headers.set(headerName, rewritten);
+}
+
+function rewriteBodyText(text, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl) {
+  let rewritten = applyReplacementRules(text, upstreamDomain, proxyHost);
+  rewritten = rewriteAnyUrlString(rewritten, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl);
+  rewritten = rewriteHtmlAttributes(rewritten, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl);
+  rewritten = rewriteCssUrls(rewritten, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl);
+  rewritten = rewriteScriptRequestLiterals(rewritten, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl);
+  return rewritten;
+}
+
+function applyReplacementRules(text, upstreamDomain, proxyHost) {
+  return replacement_rules.reduce((acc, rule) => {
+    const search = rule.search
+      .split('{upstream_hostname}').join(upstreamDomain)
+      .split('{proxy_hostname}').join(proxyHost);
+    const replace = rule.replace
+      .split('{upstream_hostname}').join(upstreamDomain)
+      .split('{proxy_hostname}').join(proxyHost);
+
+    const regex = new RegExp(escapeRegExp(search), 'g');
+    return acc.replace(regex, replace);
+  }, text);
+}
+
+function rewriteAnyUrlString(text, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl) {
+  let rewritten = text;
+  const mirroredHosts = getMirroredHosts(upstreamDomain);
+
+  for (const host of mirroredHosts) {
+    const escapedHost = escapeRegExp(host);
+    rewritten = rewritten.replace(new RegExp(`https?:\\/\\/${escapedHost}`, 'gi'), proxyOrigin);
+    rewritten = rewritten.replace(new RegExp(`https?://${escapedHost}`, 'gi'), proxyOrigin);
+    rewritten = rewritten.replace(new RegExp(`//${escapedHost}`, 'gi'), `//${proxyHost}`);
+  }
+
+  rewritten = rewritten.replace(/(["'`])((?:\/|\.\/|\.\.\/)[^"'`\s]*)\1/g, (match, quote, value) => {
+    const proxied = rewriteSingleUrl(value, upstreamDomain, proxyOrigin, baseUpstreamUrl);
+    return `${quote}${proxied}${quote}`;
+  });
+
+  return rewritten;
+}
+
+function rewriteHtmlAttributes(text, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl) {
+  const attributePattern = /(href|src|action|poster|data|srcset)=(["'])([^"']*)\2/gi;
+  return text.replace(attributePattern, (full, attr, quote, value) => {
+    if (attr.toLowerCase() === 'srcset') {
+      const rewrittenSrcset = value
+        .split(',')
+        .map(item => {
+          const trimmed = item.trim();
+          if (!trimmed) return trimmed;
+          const [urlPart, descriptor] = trimmed.split(/\s+/, 2);
+          const rewrittenUrl = rewriteSingleUrl(urlPart, upstreamDomain, proxyOrigin, baseUpstreamUrl);
+          return descriptor ? `${rewrittenUrl} ${descriptor}` : rewrittenUrl;
         })
+        .join(', ');
+      return `${attr}=${quote}${rewrittenSrcset}${quote}`;
     }
-    return response;
+
+    const rewritten = rewriteSingleUrl(value, upstreamDomain, proxyOrigin, baseUpstreamUrl);
+    return `${attr}=${quote}${rewritten}${quote}`;
+  });
 }
-async function replace_response_text(response, upstream_domain, host_name) {
-    let text = await response.text()
-    if (replacement_rules) {
-        for (let k in replacement_rules) {
-            var v = replacement_rules[k];
-            if (replacement_use_regex) {
-                k = k.replace(regexp_upstreamHostname, upstream_domain);
-                k = k.replace(regexp_proxyHostname, host_name);
-                v = v.replace(regexp_upstreamHostname, upstream_domain);
-                v = v.replace(regexp_proxyHostname, host_name);
-                text = text.replace(new RegExp(k, 'g'), v);
-            }
-            else {
-                k = k.split('{upstream_hostname}').join(upstream_domain);
-                k = k.split('{proxy_hostname}').join(host_name);
-                v = v.split('{upstream_hostname}').join(upstream_domain);
-                v = v.split('{proxy_hostname}').join(host_name);
-                text = text.split(k).join(v);
-            }
-        }
-    }
-    return text;
+
+function rewriteCssUrls(text, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl) {
+  return text.replace(/url\((['"]?)([^)'"\s]+)\1\)/gi, (full, quote, value) => {
+    const rewritten = rewriteSingleUrl(value, upstreamDomain, proxyOrigin, baseUpstreamUrl);
+    const useQuote = quote || '';
+    return `url(${useQuote}${rewritten}${useQuote})`;
+  });
 }
-async function is_mobile_user_agent(user_agent_info) {
-    var agents = ["Android", "iPhone", "SymbianOS", "Windows Phone", "iPad", "iPod"];
-    for (var v = 0; v < agents.length; v++) {
-        if (user_agent_info.indexOf(agents[v]) > 0) {
-            return true;
-        }
+
+function rewriteScriptRequestLiterals(text, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl) {
+  let rewritten = text;
+
+  const patterns = [
+    /(fetch\s*\(\s*["'])([^"']+)(["'])/gi,
+    /(new\s+Request\s*\(\s*["'])([^"']+)(["'])/gi,
+    /(\.open\s*\(\s*["'][A-Za-z]+["']\s*,\s*["'])([^"']+)(["'])/gi,
+  ];
+
+  for (const pattern of patterns) {
+    rewritten = rewritten.replace(pattern, (full, prefix, value, suffix) => {
+      const proxied = rewriteSingleUrl(value, upstreamDomain, proxyOrigin, baseUpstreamUrl);
+      return `${prefix}${proxied}${suffix}`;
+    });
+  }
+
+  return rewritten;
+}
+
+function rewriteSingleUrl(value, upstreamDomain, proxyOrigin, baseUpstreamUrl) {
+  if (!value) return value;
+
+  const lower = value.toLowerCase();
+  if (
+    lower.startsWith('javascript:') ||
+    lower.startsWith('vbscript:') ||
+    lower.startsWith('mailto:') ||
+    lower.startsWith('tel:') ||
+    lower.startsWith('data:') ||
+    lower.startsWith('#')
+  ) {
+    return value;
+  }
+
+  try {
+    const parsed = new URL(value, baseUpstreamUrl);
+    const proxyOriginUrl = new URL(proxyOrigin);
+    const mirroredHosts = getMirroredHosts(upstreamDomain);
+    if (mirroredHosts.includes(parsed.hostname)) {
+      parsed.protocol = proxyOriginUrl.protocol;
+      parsed.host = proxyOriginUrl.host;
+      return parsed.toString();
     }
-    return false;
+
+    if (parsed.hostname === proxyOriginUrl.hostname) {
+      return parsed.toString();
+    }
+
+    if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) {
+      const proxyUrl = new URL(parsed.pathname + parsed.search + parsed.hash, proxyOrigin);
+      return proxyUrl.toString();
+    }
+
+    return value;
+  } catch (e) {
+    return value;
+  }
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getMirroredHosts(upstreamDomain) {
+  const trimmed = upstreamDomain.replace(/\.$/, '').toLowerCase();
+  const base = trimmed.replace(/^www\./, '');
+  const hosts = [trimmed, base, `www.${base}`];
+  if (isExactOrSubdomain(trimmed, 'gimkit.com')) {
+    hosts.push(...default_mirrored_hostnames);
+  }
+  return Array.from(new Set(hosts));
+}
+
+function isExactOrSubdomain(hostname, domain) {
+  return hostname === domain || hostname.endsWith(`.${domain}`);
+}
+
+function safeParseUrl(value, fallbackBase) {
+  try {
+    return new URL(value, fallbackBase);
+  } catch (e) {
+    return null;
+  }
+}
+
+function is_mobile_user_agent(userAgentInfo) {
+  const agents = ['Android', 'iPhone', 'SymbianOS', 'Windows Phone', 'iPad', 'iPod'];
+  for (const agent of agents) {
+    if (userAgentInfo.includes(agent)) {
+      return true;
+    }
+  }
+  return false;
 }
