@@ -38,6 +38,7 @@ const replacement_content_types = [
   'application/x-javascript',
   'application/json',
 ];
+const default_mirrored_hostnames = ['gimkit.com', 'www.gimkit.com'];
 
 addEventListener('fetch', event => {
   event.respondWith(fetchAndApply(event.request));
@@ -189,11 +190,14 @@ function applyReplacementRules(text, upstreamDomain, proxyHost) {
 
 function rewriteAnyUrlString(text, upstreamDomain, proxyHost, proxyOrigin, baseUpstreamUrl) {
   let rewritten = text;
+  const mirroredHosts = getMirroredHosts(upstreamDomain);
 
-  const escapedUpstream = escapeRegExp(upstreamDomain);
-  rewritten = rewritten.replace(new RegExp(`https?:\\/\\/${escapedUpstream}`, 'gi'), proxyOrigin);
-  rewritten = rewritten.replace(new RegExp(`https?://${escapedUpstream}`, 'gi'), proxyOrigin);
-  rewritten = rewritten.replace(new RegExp(`(?<!:)//${escapedUpstream}`, 'gi'), `//${proxyHost}`);
+  for (const host of mirroredHosts) {
+    const escapedHost = escapeRegExp(host);
+    rewritten = rewritten.replace(new RegExp(`https?:\\/\\/${escapedHost}`, 'gi'), proxyOrigin);
+    rewritten = rewritten.replace(new RegExp(`https?://${escapedHost}`, 'gi'), proxyOrigin);
+    rewritten = rewritten.replace(new RegExp(`//${escapedHost}`, 'gi'), `//${proxyHost}`);
+  }
 
   rewritten = rewritten.replace(/(["'`])((?:\/|\.\/|\.\.\/)[^"'`\s]*)\1/g, (match, quote, value) => {
     const proxied = rewriteSingleUrl(value, upstreamDomain, proxyOrigin, baseUpstreamUrl);
@@ -268,13 +272,15 @@ function rewriteSingleUrl(value, upstreamDomain, proxyOrigin, baseUpstreamUrl) {
 
   try {
     const parsed = new URL(value, baseUpstreamUrl);
-    if (parsed.hostname === upstreamDomain || parsed.hostname.endsWith(`.${upstreamDomain}`)) {
-      parsed.protocol = new URL(proxyOrigin).protocol;
-      parsed.host = new URL(proxyOrigin).host;
+    const proxyOriginUrl = new URL(proxyOrigin);
+    const mirroredHosts = getMirroredHosts(upstreamDomain);
+    if (mirroredHosts.includes(parsed.hostname)) {
+      parsed.protocol = proxyOriginUrl.protocol;
+      parsed.host = proxyOriginUrl.host;
       return parsed.toString();
     }
 
-    if (parsed.hostname === proxyOrigin.hostname) {
+    if (parsed.hostname === proxyOriginUrl.hostname) {
       return parsed.toString();
     }
 
@@ -291,6 +297,12 @@ function rewriteSingleUrl(value, upstreamDomain, proxyOrigin, baseUpstreamUrl) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getMirroredHosts(upstreamDomain) {
+  const trimmed = upstreamDomain.replace(/\.$/, '').toLowerCase();
+  const base = trimmed.replace(/^www\./, '');
+  return Array.from(new Set([trimmed, base, `www.${base}`, ...default_mirrored_hostnames]));
 }
 
 function is_mobile_user_agent(userAgentInfo) {
