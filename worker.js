@@ -12,8 +12,8 @@ const http_response_headers_set = {
   'X-Frame-Options': 'ALLOW FROM https://www.example.com',
   'Content-Security-Policy': "frame-ancestors 'self' https://www.example.com;",
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Credentials': 'true',
-  'X-Proxy-Injector': 'gimods injector',
+  'Access-Control-Allow-Credentials': true,
+  'X-Proxy-Injector': 'gimods Injector',
 };
 
 const http_response_headers_delete = [
@@ -156,10 +156,11 @@ function rewriteHeaderUrl(headers, headerName, upstreamUrl, upstreamDomain, prox
   const headerValue = headers.get(headerName);
   let rewritten = rewriteAnyUrlString(headerValue, upstreamDomain, proxyHost, proxyOrigin, upstreamUrl.toString());
 
-  if (upstream_allow_override && headerName === 'location' && rewritten.includes('googleusercontent.com')) {
-    const raw = headers.get(headerName);
-    const newUpstream = raw.substring(8, raw.indexOf('/', 8));
-    rewritten = `${rewritten}&${upstream_get_parameter}=${newUpstream}`;
+  if (upstream_allow_override && headerName === 'location') {
+    const parsedRaw = safeParseUrl(headerValue, upstreamUrl.toString());
+    if (parsedRaw && isExactOrSubdomain(parsedRaw.hostname, 'googleusercontent.com')) {
+      rewritten = `${rewritten}&${upstream_get_parameter}=${parsedRaw.hostname}`;
+    }
   }
 
   headers.set(headerName, rewritten);
@@ -243,7 +244,7 @@ function rewriteScriptRequestLiterals(text, upstreamDomain, proxyHost, proxyOrig
   const patterns = [
     /(fetch\s*\(\s*["'])([^"']+)(["'])/gi,
     /(new\s+Request\s*\(\s*["'])([^"']+)(["'])/gi,
-    /(\.open\s*\(\s*["'][A-Z]+["']\s*,\s*["'])([^"']+)(["'])/gi,
+    /(\.open\s*\(\s*["'][A-Za-z]+["']\s*,\s*["'])([^"']+)(["'])/gi,
   ];
 
   for (const pattern of patterns) {
@@ -262,6 +263,7 @@ function rewriteSingleUrl(value, upstreamDomain, proxyOrigin, baseUpstreamUrl) {
   const lower = value.toLowerCase();
   if (
     lower.startsWith('javascript:') ||
+    lower.startsWith('vbscript:') ||
     lower.startsWith('mailto:') ||
     lower.startsWith('tel:') ||
     lower.startsWith('data:') ||
@@ -302,7 +304,23 @@ function escapeRegExp(value) {
 function getMirroredHosts(upstreamDomain) {
   const trimmed = upstreamDomain.replace(/\.$/, '').toLowerCase();
   const base = trimmed.replace(/^www\./, '');
-  return Array.from(new Set([trimmed, base, `www.${base}`, ...default_mirrored_hostnames]));
+  const hosts = [trimmed, base, `www.${base}`];
+  if (isExactOrSubdomain(trimmed, 'gimkit.com')) {
+    hosts.push(...default_mirrored_hostnames);
+  }
+  return Array.from(new Set(hosts));
+}
+
+function isExactOrSubdomain(hostname, domain) {
+  return hostname === domain || hostname.endsWith(`.${domain}`);
+}
+
+function safeParseUrl(value, fallbackBase) {
+  try {
+    return new URL(value, fallbackBase);
+  } catch (e) {
+    return null;
+  }
 }
 
 function is_mobile_user_agent(userAgentInfo) {
